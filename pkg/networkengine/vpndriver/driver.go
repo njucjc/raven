@@ -3,7 +3,6 @@ package vpndriver
 import (
 	"fmt"
 	"os"
-	"sort"
 	"sync"
 
 	"github.com/vishvananda/netlink"
@@ -73,24 +72,19 @@ func New(name string, cfg *config.Config) (Driver, error) {
 // Returns nil if no central gateway found.
 // A central gateway is used to forward traffic between gateway under nat network,
 // in which the gateways can not establish ipsec connection directly.
-func FindCentralGwFn(network *types.Network) *types.Endpoint {
-	candidates := make([]*types.Endpoint, 0)
-	candidates = append(candidates, network.LocalEndpoint)
-	for _, v := range network.RemoteEndpoints {
-		candidates = append(candidates, v)
+func FindCentralGwFn(network *types.Network) []*types.Endpoint {
+	if network.LocalEndpoint.Central {
+		return []*types.Endpoint{network.LocalEndpoint}
 	}
-	// TODO: Maybe cause central ep switch when add or delete a candidate gateway because of sorting
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].NodeName < candidates[j].NodeName
-	})
 
-	var central *types.Endpoint
-	for i := range candidates {
-		if !candidates[i].UnderNAT {
-			central = candidates[i]
+	for _, candidate := range network.RemoteEndpoints {
+		for _, ep := range candidate {
+			if ep.Central {
+				return candidate
+			}
 		}
 	}
-	return central
+	return []*types.Endpoint{}
 }
 
 func DefaultMTU() (int, error) {

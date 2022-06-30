@@ -137,7 +137,7 @@ func (c *EngineController) sync() error {
 	// As we are going to rebuild a full state, so cleanup before proceeding.
 	c.network = &types.Network{
 		LocalEndpoint:   nil,
-		RemoteEndpoints: make(map[types.GatewayName]*types.Endpoint),
+		RemoteEndpoints: make(map[types.GatewayName][]*types.Endpoint),
 		LocalNodeInfo:   make(map[types.NodeName]*v1alpha1.NodeInfo),
 		RemoteNodeInfo:  make(map[types.NodeName]*v1alpha1.NodeInfo),
 	}
@@ -145,17 +145,18 @@ func (c *EngineController) sync() error {
 
 	for _, gw := range gws {
 		// try to update public IP if empty.
-		if ep := gw.Status.ActiveEndpoint; ep != nil && ep.PublicIP == "" {
-			err := c.configGatewayPublicIP(gw)
-			if err != nil {
-				klog.ErrorS(err, "error config gateway public ip", "gateway", klog.KObj(gw))
+		for _, aep := range gw.Status.ActiveEndpoints {
+			if aep.Endpoint.PublicIP == "" {
+				err := c.configGatewayPublicIP(gw.Name, aep)
+				if err != nil {
+					klog.ErrorS(err, "error config gateway public ip", "gateway", klog.KObj(gw))
+				}
 			}
-			continue
 		}
 		if !c.shouldHandleGateway(gw) {
 			continue
 		}
-		c.syncNodeInfo(gw.Status.Nodes)
+		c.syncNodeInfo(gw)
 	}
 	for _, gw := range gws {
 		if !c.shouldHandleGateway(gw) {
@@ -183,51 +184,74 @@ func (c *EngineController) sync() error {
 	return nil
 }
 
-func (c *EngineController) syncNodeInfo(nodes []v1alpha1.NodeInfo) {
-	for _, v := range nodes {
-		c.nodeInfos[types.NodeName(v.NodeName)] = v.DeepCopy()
+func (c *EngineController) syncNodeInfo(gw *v1alpha1.Gateway) {
+	for _, aep := range gw.Status.ActiveEndpoints {
+		for _, v := range aep.Nodes {
+			c.nodeInfos[types.NodeName(v.NodeName)] = v.DeepCopy()
+		}
 	}
 }
 
 func (c *EngineController) syncGateway(gw *v1alpha1.Gateway) {
-	aep := gw.Status.ActiveEndpoint
-	subnets := getMergedSubnets(gw.Status.Nodes)
-	cfg := make(map[string]string)
-	for k := range aep.Config {
-		cfg[k] = aep.Config[k]
-	}
-	var nodeInfo *v1alpha1.NodeInfo
-	if nodeInfo = c.nodeInfos[types.NodeName(aep.NodeName)]; nodeInfo == nil {
-		klog.Errorf("node %s is found in Endpoint but not existed in NodeInfo", aep.NodeName)
-		return
-	}
-	ep := &types.Endpoint{
-		GatewayName: types.GatewayName(gw.Name),
-		NodeName:    types.NodeName(aep.NodeName),
-		Subnets:     subnets,
-		PrivateIP:   nodeInfo.PrivateIP,
-		PublicIP:    aep.PublicIP,
-		UnderNAT:    aep.UnderNAT,
-		Config:      cfg,
-	}
-	var isLocalGateway bool
-	defer func() {
-		for _, v := range gw.Status.Nodes {
-			if isLocalGateway {
-				c.network.LocalNodeInfo[types.NodeName(v.NodeName)] = v.DeepCopy()
-			} else {
-				c.network.RemoteNodeInfo[types.NodeName(v.NodeName)] = v.DeepCopy()
+	isLocalGateway := false
+	for _, aep := range gw.Status.ActiveEndpoints {
+		for _, v := range aep.Nodes {
+			if v.NodeName == c.nodeName {
+				isLocalGateway = true
+				break
 			}
 		}
-	}()
-	for _, v := range gw.Status.Nodes {
-		if v.NodeName == c.nodeName {
-			c.network.LocalEndpoint = ep
-			isLocalGateway = true
-			return
+		if isLocalGateway {
+			break
 		}
 	}
-	c.network.RemoteEndpoints[types.GatewayName(gw.Name)] = ep
+
+	for _, aep := range gw.Status.ActiveEndpoints {
+		subnets := getMergedSubnets(aep.Nodes)
+		cfg := make(map[string]string)
+		for k := range aep.Endpoint.Config {
+			cfg[k] = aep.Endpoint.Config[k]
+		}
+		var nodeInfo *v1alpha1.NodeInfo
+		if nodeInfo = c.nodeInfos[types.NodeName(aep.Endpoint.NodeName)]; nodeInfo == nil {
+			klog.Errorf("node %s is found in Endpoint but not existed in NodeInfo", aep.Endpoint.NodeName)
+			return
+		}
+		ep := &types.Endpoint{
+			GatewayName: types.GatewayName(gw.Name),
+			NodeName:    types.NodeName(aep.Endpoint.NodeName),
+			Subnets:     subnets,
+			PrivateIP:   nodeInfo.PrivateIP,
+			PublicIP:    aep.Endpoint.PublicIP,
+			Central:     gw.Status.Central,
+			Forwards:    make(map[v1alpha1.Forward]struct{}),
+			Config:      cfg,
+		}
+		for _, forward := range aep.Forwards {
+			ep.Forwards[forward] = struct{}{}
+		}
+
+		if !isLocalGateway {
+			c.network.RemoteEndpoints[ep.GatewayName] = append(c.network.RemoteEndpoints[ep.GatewayName], ep)
+			for _, v := range aep.Nodes {
+				c.network.RemoteNodeInfo[types.NodeName(v.NodeName)] = v.DeepCopy()
+			}
+		} else {
+			isLocalActiveEndpoint := false
+			for _, v := range aep.Nodes {
+				if v.NodeName == c.nodeName {
+					c.network.LocalEndpoint = ep
+					isLocalActiveEndpoint = true
+					break
+				}
+			}
+			for _, v := range aep.Nodes {
+				if isLocalActiveEndpoint {
+					c.network.LocalNodeInfo[types.NodeName(v.NodeName)] = v.DeepCopy()
+				}
+			}
+		}
+	}
 }
 
 func (c *EngineController) handleEventErr(err error, event interface{}) {
@@ -247,19 +271,21 @@ func (c *EngineController) handleEventErr(err error, event interface{}) {
 }
 
 func (c *EngineController) shouldHandleGateway(gateway *v1alpha1.Gateway) bool {
-	if gateway.Status.ActiveEndpoint == nil {
-		klog.InfoS("no active endpoint , waiting for sync", "gateway", klog.KObj(gateway))
+	if len(gateway.Status.ActiveEndpoints) == 0 {
+		klog.InfoS("no active endpoints, waiting for sync", "gateway", klog.KObj(gateway))
 		return false
 	}
-	if gateway.Status.ActiveEndpoint.PublicIP == "" {
-		klog.InfoS("no public IP for gateway, waiting for sync", "gateway", klog.KObj(gateway))
-		return false
+	for _, aep := range gateway.Status.ActiveEndpoints {
+		if aep.Endpoint.PublicIP == "" {
+			klog.InfoS("no public IP for gateway active endpoint, waiting for sync", "active endpoint", aep, "gateway", klog.KObj(gateway))
+			return false
+		}
 	}
 	return true
 }
 
-func (c *EngineController) configGatewayPublicIP(gateway *v1alpha1.Gateway) error {
-	if gateway.Status.ActiveEndpoint.NodeName != c.nodeName {
+func (c *EngineController) configGatewayPublicIP(gwName string, aep *v1alpha1.ActiveEndpoint) error {
+	if aep.Endpoint.NodeName != c.nodeName {
 		return nil
 	}
 	publicIP, err := utils.GetPublicIP()
@@ -269,7 +295,7 @@ func (c *EngineController) configGatewayPublicIP(gateway *v1alpha1.Gateway) erro
 	// retry to update public ip of localGateway
 	err = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		// get localGateway from api server
-		apiGw, err := c.ravenClient.RavenV1alpha1().Gateways().Get(context.Background(), gateway.Name, v1.GetOptions{})
+		apiGw, err := c.ravenClient.RavenV1alpha1().Gateways().Get(context.Background(), gwName, v1.GetOptions{})
 		if err != nil {
 			return err
 		}

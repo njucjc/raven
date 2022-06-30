@@ -25,6 +25,7 @@ import (
 	"reflect"
 	"time"
 
+	"github.com/openyurtio/raven-controller-manager/pkg/ravencontroller/apis/raven/v1alpha1"
 	ravenclientset "github.com/openyurtio/raven-controller-manager/pkg/ravencontroller/client/clientset/versioned"
 	"github.com/pkg/errors"
 	"github.com/vdobler/ht/errorlist"
@@ -216,8 +217,8 @@ func (w *wireguard) Apply(network *types.Network, routeDriverMTUFn func(*types.N
 		return errors.New("retry to config public key")
 	}
 	// 1. Compute desiredConnections
-	centralGw := findCentralGw(network)
-	desiredConnections, centralAllowedIPs := w.computeDesiredConnections(network)
+	centralGws := findCentralGw(network)
+	desiredConnections := w.computeDesiredConnections(network)
 	if len(desiredConnections) == 0 {
 		klog.Infof("no desired connections, cleaning vpn connections")
 		return w.Cleanup()
@@ -277,8 +278,12 @@ func (w *wireguard) Apply(network *types.Network, routeDriverMTUFn func(*types.N
 		klog.InfoS("create connection", "c", newConn)
 
 		allowedIPs := parseSubnets(newConn.RemoteEndpoint.Subnets)
-		if newConn.RemoteEndpoint.NodeName == centralGw.NodeName {
-			allowedIPs = append(allowedIPs, parseSubnets(centralAllowedIPs)...)
+		for _, centralGw := range centralGws {
+			if newConn.RemoteEndpoint.NodeName == centralGw.NodeName {
+				centralAllowedIPs := w.computeCentralAllowedIPs(network, centralGw)
+				allowedIPs = append(allowedIPs, parseSubnets(centralAllowedIPs)...)
+				break
+			}
 		}
 
 		remotePort := ListenPort
@@ -344,30 +349,42 @@ func (w *wireguard) Cleanup() error {
 	return errList.AsError()
 }
 
-func (w *wireguard) computeDesiredConnections(network *types.Network) (map[string]*vpndriver.Connection, []string) {
+func (w *wireguard) computeCentralAllowedIPs(network *types.Network, centralGw *types.Endpoint) []string {
+	allowedIPs := make([]string, 0)
+	for _, remoteEndpoints := range network.RemoteEndpoints {
+		for _, ep := range remoteEndpoints {
+			if _, ok := centralGw.Forwards[v1alpha1.Forward{From: string(network.LocalEndpoint.GatewayName), To: string(ep.GatewayName)}]; ok {
+				allowedIPs = append(allowedIPs, ep.Subnets...)
+			}
+		}
+	}
+	return allowedIPs
+}
+
+func (w *wireguard) computeDesiredConnections(network *types.Network) map[string]*vpndriver.Connection {
 
 	// This is the desired connection calculated from given *types.Network
 	desiredConns := make(map[string]*vpndriver.Connection)
-	centralAllowedIPs := make([]string, 0)
-	for _, remote := range network.RemoteEndpoints {
-		if _, ok := remote.Config[PublicKey]; !ok {
-			continue
-		}
+	for _, endpoints := range network.RemoteEndpoints {
+		for _, remote := range endpoints {
+			if _, ok := remote.Config[PublicKey]; !ok {
+				continue
+			}
 
-		// if local gateway is not central gateway and remote endpoint is NATed
-		// append all subnets of remote gateway into central allowed IPs.
-		if network.LocalEndpoint.UnderNAT && remote.UnderNAT {
-			centralAllowedIPs = append(centralAllowedIPs, remote.Subnets...)
-			continue
-		}
+			// if local gateway and remote endpoint are not central gateway
+			// then we need to forward the traffic from local gateway to central endpoint and skip direct connection between them
+			if !network.LocalEndpoint.Central && !remote.Central {
+				continue
+			}
 
-		name := connectionName(string(network.LocalEndpoint.NodeName), string(remote.NodeName))
-		desiredConns[name] = &vpndriver.Connection{
-			LocalEndpoint:  network.LocalEndpoint.Copy(),
-			RemoteEndpoint: remote.Copy(),
+			name := connectionName(string(network.LocalEndpoint.NodeName), string(remote.NodeName))
+			desiredConns[name] = &vpndriver.Connection{
+				LocalEndpoint:  network.LocalEndpoint.Copy(),
+				RemoteEndpoint: remote.Copy(),
+			}
 		}
 	}
-	return desiredConns, centralAllowedIPs
+	return desiredConns
 }
 
 func (w *wireguard) removePeer(key *wgtypes.Key) error {
@@ -431,21 +448,23 @@ func (w *wireguard) calWgRules() map[string]*netlink.Rule {
 //   ip route add {remote_subnet} dev raven-wg0 table {wgRouteTableID}
 func (w *wireguard) calWgRoutes(network *types.Network) map[string]*netlink.Route {
 	routes := make(map[string]*netlink.Route)
-	for _, v := range network.RemoteEndpoints {
-		for _, dstCIDR := range v.Subnets {
-			_, ipnet, err := net.ParseCIDR(dstCIDR)
-			if err != nil {
-				klog.ErrorS(err, "error parsing cidr", "cidr", dstCIDR)
-				continue
+	for _, endpoints := range network.RemoteEndpoints {
+		for _, v := range endpoints {
+			for _, dstCIDR := range v.Subnets {
+				_, ipnet, err := net.ParseCIDR(dstCIDR)
+				if err != nil {
+					klog.ErrorS(err, "error parsing cidr", "cidr", dstCIDR)
+					continue
+				}
+				nr := &netlink.Route{
+					LinkIndex: w.wgLink.Attrs().Index,
+					Scope:     netlink.SCOPE_LINK,
+					Dst:       ipnet,
+					Table:     wgRouteTableID,
+					MTU:       w.wgLink.Attrs().MTU,
+				}
+				routes[networkutil.RouteKey(nr)] = nr
 			}
-			nr := &netlink.Route{
-				LinkIndex: w.wgLink.Attrs().Index,
-				Scope:     netlink.SCOPE_LINK,
-				Dst:       ipnet,
-				Table:     wgRouteTableID,
-				MTU:       w.wgLink.Attrs().MTU,
-			}
-			routes[networkutil.RouteKey(nr)] = nr
 		}
 	}
 	return routes

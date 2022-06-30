@@ -35,8 +35,10 @@ type Endpoint struct {
 	Subnets   []string
 	PrivateIP string
 	PublicIP  string
-	UnderNAT  bool
-	Config    map[string]string
+
+	Central  bool
+	Forwards map[v1alpha1.Forward]struct{}
+	Config   map[string]string
 }
 
 func (e *Endpoint) String() string {
@@ -50,6 +52,10 @@ func (e *Endpoint) Copy() *Endpoint {
 	copied := *e
 	copied.Subnets = make([]string, len(e.Subnets))
 	copy(copied.Subnets, e.Subnets)
+	copied.Forwards = make(map[v1alpha1.Forward]struct{})
+	for k, v := range e.Forwards {
+		copied.Forwards[k] = v
+	}
 	copied.Config = make(map[string]string)
 	for k, v := range e.Config {
 		copied.Config[k] = v
@@ -63,11 +69,11 @@ type Network struct {
 	// LocalEndpoint is the Endpoint of local gateway node.
 	// Equals to nil if there is no local gateway node.
 	LocalEndpoint *Endpoint
-	// LocalNodeInfo stores NodeInfo of all nodes in local gateway.
+	// LocalNodeInfo stores NodeInfo of all nodes in local active endpoint.
 	LocalNodeInfo map[NodeName]*v1alpha1.NodeInfo
 	// RemoteEndpoints is the Endpoint of all remote gateway nodes, indexed by their gateway name.
 	// Equals to nil if there is no remote gateway node.
-	RemoteEndpoints map[GatewayName]*Endpoint
+	RemoteEndpoints map[GatewayName][]*Endpoint
 	// RemoteNodeInfo stores NodeInfo of all nodes in remote gateways
 	RemoteNodeInfo map[NodeName]*v1alpha1.NodeInfo
 }
@@ -79,11 +85,13 @@ func (n *Network) Copy() *Network {
 	nw := &Network{
 		LocalEndpoint:   n.LocalEndpoint.Copy(),
 		LocalNodeInfo:   make(map[NodeName]*v1alpha1.NodeInfo),
-		RemoteEndpoints: make(map[GatewayName]*Endpoint),
+		RemoteEndpoints: make(map[GatewayName][]*Endpoint),
 		RemoteNodeInfo:  make(map[NodeName]*v1alpha1.NodeInfo),
 	}
 	for k, v := range n.RemoteEndpoints {
-		nw.RemoteEndpoints[k] = v.Copy()
+		for _, ep := range v {
+			nw.RemoteEndpoints[k] = append(nw.RemoteEndpoints[k], ep.Copy())
+		}
 	}
 	for k, v := range n.LocalNodeInfo {
 		nw.LocalNodeInfo[k] = v.DeepCopy()

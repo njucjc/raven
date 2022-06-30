@@ -4,7 +4,7 @@ go 1.16
 
 require (
 	github.com/EvilSuperstars/go-cidrman v0.0.0-20190607145828-28e79e32899a
-	github.com/openyurtio/raven-controller-manager v0.1.1-0.20220622025909-98a46a8e8e07
+	github.com/openyurtio/raven-controller-manager v0.0.0-20220711023644-77ab2e8db4d7
 	github.com/pkg/errors v0.9.1
 	github.com/spf13/cobra v1.5.0
 	github.com/spf13/pflag v1.0.5
@@ -23,6 +23,7 @@ require (
 
 replace (
 	github.com/googleapis/gnostic => github.com/googleapis/gnostic v0.5.1
+	github.com/openyurtio/raven-controller-manager => github.com/njucjc/raven-controller-manager v0.0.0-20220711023644-77ab2e8db4d7
 	k8s.io/api => k8s.io/api v0.23.2
 	k8s.io/component-base => k8s.io/component-base v0.23.2
 )

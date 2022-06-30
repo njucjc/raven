@@ -23,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/openyurtio/raven-controller-manager/pkg/ravencontroller/apis/raven/v1alpha1"
 	"github.com/vdobler/ht/errorlist"
 	"k8s.io/klog/v2"
 
@@ -133,49 +134,6 @@ func (l *libreswan) MTU() (int, error) {
 	return mtu - IPSecEncapLen, nil
 }
 
-// getEndpointResolver returns a function that resolve the left subnets and the Endpoint that should connect to.
-func (l *libreswan) getEndpointResolver(network *types.Network) func(centralGw, remoteGw *types.Endpoint) (leftSubnets []string, connectTo *types.Endpoint) {
-	snUnderNAT := make(map[types.GatewayName][]string)
-	for _, v := range network.RemoteEndpoints {
-		if v.UnderNAT {
-			snUnderNAT[v.GatewayName] = v.Subnets
-		}
-	}
-	return func(centralGw, remoteGw *types.Endpoint) (leftSubnets []string, connectTo *types.Endpoint) {
-		leftSubnets = network.LocalEndpoint.Subnets
-		if centralGw == nil {
-			// If both local and remote gateway are NATed but no central gateway found,
-			// we cannot set up vpn connections between the local and remote gateway.
-			if network.LocalEndpoint.UnderNAT && remoteGw.UnderNAT {
-				return nil, nil
-			}
-			return leftSubnets, remoteGw
-		}
-
-		if centralGw.NodeName == l.nodeName {
-			if remoteGw.UnderNAT {
-				// If the local gateway is the central gateway,
-				// in order to forward traffic from other NATed gateway to the NATed remoteGw,
-				// append all subnets of other NATed gateways into left subnets.
-				for gwName, v := range snUnderNAT {
-					if gwName != remoteGw.GatewayName {
-						leftSubnets = append(leftSubnets, v...)
-					}
-				}
-			}
-			return leftSubnets, remoteGw
-		}
-
-		// If both local and remote are NATed, and the local gateway is not the central gateway,
-		// connects to central gateway to forward traffic.
-		if network.LocalEndpoint.UnderNAT && remoteGw.UnderNAT {
-			return leftSubnets, centralGw
-		}
-
-		return leftSubnets, remoteGw
-	}
-}
-
 func (l *libreswan) whackConnectToEndpoint(connectionName string, connection *vpndriver.Connection) error {
 	args := make([]string, 0)
 	leftID := fmt.Sprintf("@%s-%s-%s", connection.LocalEndpoint.PrivateIP, connection.LocalSubnet, connection.RemoteSubnet)
@@ -200,7 +158,7 @@ func (l *libreswan) whackConnectToEndpoint(connectionName string, connection *vp
 	if err := whackCmd(args...); err != nil {
 		return err
 	}
-	if connection.LocalEndpoint.UnderNAT {
+	if !connection.LocalEndpoint.Central {
 		if err := whackCmd("--route", "--name", connectionName); err != nil {
 			return err
 		}
@@ -211,27 +169,75 @@ func (l *libreswan) whackConnectToEndpoint(connectionName string, connection *vp
 	return nil
 }
 
+// getEndpointResolver returns a function that resolve the left subnets and the Endpoint that should connect to.
+func (l *libreswan) getEndpointResolver(network *types.Network, centralGw *types.Endpoint) func(remoteGw *types.Endpoint) (leftSubnets []string, connectTo *types.Endpoint) {
+	forwardGateways := make(map[types.GatewayName]struct{})
+	for forward := range centralGw.Forwards {
+		forwardGateways[types.GatewayName(forward.From)] = struct{}{}
+	}
+
+	snForwards := make(map[types.GatewayName][]string)
+	for _, remoteEndpoints := range network.RemoteEndpoints {
+		for _, ep := range remoteEndpoints {
+			if _, ok := forwardGateways[ep.GatewayName]; ok {
+				snForwards[ep.GatewayName] = append(snForwards[ep.GatewayName], ep.Subnets...)
+			}
+		}
+	}
+	return func(remoteGw *types.Endpoint) (leftSubnets []string, connectTo *types.Endpoint) {
+		leftSubnets = network.LocalEndpoint.Subnets
+
+		if centralGw.NodeName == l.nodeName {
+			// If the local gateway is the central gateway,
+			// in order to forward traffic from other NATed gateway to the NATed remoteGw,
+			// append all subnets of other NATed gateways into left subnets.
+			for gwName, v := range snForwards {
+				if gwName != remoteGw.GatewayName {
+					leftSubnets = append(leftSubnets, v...)
+				}
+			}
+			return leftSubnets, remoteGw
+		}
+
+		// If both local and remote are not central gateway, connects to central gateway to forward traffic.
+		if !network.LocalEndpoint.Central && !remoteGw.Central {
+			if _, ok := centralGw.Forwards[v1alpha1.Forward{From: string(network.LocalEndpoint.GatewayName), To: string(remoteGw.GatewayName)}]; ok {
+				return leftSubnets, centralGw
+			}
+			return []string{}, nil
+		}
+
+		return leftSubnets, remoteGw
+	}
+}
+
 func (l *libreswan) computeDesiredConnections(network *types.Network) map[string]*vpndriver.Connection {
-	centralGw := findCentralGw(network)
-	resolveEndpoint := l.getEndpointResolver(network)
+	centralGws := findCentralGw(network)
+
 	// This is the desired connection calculated from given *types.Network
 	desiredConns := make(map[string]*vpndriver.Connection)
 
 	leftEndpoint := network.LocalEndpoint
-	for _, remoteGw := range network.RemoteEndpoints {
-		leftSubnets, connectTo := resolveEndpoint(centralGw, remoteGw)
-		for _, leftSubnet := range leftSubnets {
-			for _, rightSubnet := range remoteGw.Subnets {
-				name := connectionName(leftEndpoint.PrivateIP, connectTo.PrivateIP, leftSubnet, rightSubnet)
-				desiredConns[name] = &vpndriver.Connection{
-					LocalEndpoint:  leftEndpoint.Copy(),
-					RemoteEndpoint: connectTo.Copy(),
-					LocalSubnet:    leftSubnet,
-					RemoteSubnet:   rightSubnet,
+	for _, remoteGws := range network.RemoteEndpoints {
+		for _, rightEndpoint := range remoteGws {
+			for _, centralGw := range centralGws {
+				resolveEndpoint := l.getEndpointResolver(network, centralGw)
+				leftSubnets, connectTo := resolveEndpoint(rightEndpoint)
+				for _, leftSubnet := range leftSubnets {
+					for _, rightSubnet := range rightEndpoint.Subnets {
+						name := connectionName(leftEndpoint.PrivateIP, connectTo.PrivateIP, leftSubnet, rightSubnet)
+						desiredConns[name] = &vpndriver.Connection{
+							LocalEndpoint:  leftEndpoint.Copy(),
+							RemoteEndpoint: connectTo.Copy(),
+							LocalSubnet:    leftSubnet,
+							RemoteSubnet:   rightSubnet,
+						}
+					}
 				}
 			}
 		}
 	}
+
 	return desiredConns
 }
 
