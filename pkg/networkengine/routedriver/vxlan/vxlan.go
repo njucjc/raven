@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"fmt"
 	"io/ioutil"
+	"math"
 	"net"
 	"syscall"
 
@@ -128,6 +129,10 @@ func (vx *vxlan) MTU(network *types.Network) (int, error) {
 	var defaultLink netlink.Link
 	var err error
 	if vx.isGatewayRole(network) {
+		// Only one node, vxlan interface is ignored
+		if len(network.LocalNodeInfo) == 1 {
+			return math.MaxInt, nil
+		}
 		for nodeName, v := range network.LocalNodeInfo {
 			if nodeName != vx.nodeName {
 				defaultLink, err = defaultLinkTo(net.ParseIP(v.PrivateIP))
@@ -240,25 +245,27 @@ func (vx *vxlan) calRouteOnNonGateway(network *types.Network) map[string]*netlin
 		}
 
 		via := vxlanIP(net.ParseIP(network.LocalEndpoint.PrivateIP))
-		for _, v := range network.RemoteEndpoints {
-			for _, dstCIDR := range v.Subnets {
-				_, ipnet, err := net.ParseCIDR(dstCIDR)
-				if err != nil {
-					klog.ErrorS(err, "error parsing cidr", "cidr", dstCIDR)
-					continue
+		for _, endpoints := range network.RemoteEndpoints {
+			for _, v := range endpoints {
+				for _, dstCIDR := range v.Subnets {
+					_, ipnet, err := net.ParseCIDR(dstCIDR)
+					if err != nil {
+						klog.ErrorS(err, "error parsing cidr", "cidr", dstCIDR)
+						continue
+					}
+					nr := &netlink.Route{
+						LinkIndex: vx.vxlanIface.Attrs().Index,
+						Scope:     netlink.SCOPE_UNIVERSE,
+						Dst:       ipnet,
+						Gw:        via,
+						Table:     routeTableID,
+						Src:       src,
+						Flags:     int(netlink.FLAG_ONLINK),
+						// TODO should minus vpn mtu OverHead
+						MTU: vx.vxlanIface.Attrs().MTU,
+					}
+					routes[networkutil.RouteKey(nr)] = nr
 				}
-				nr := &netlink.Route{
-					LinkIndex: vx.vxlanIface.Attrs().Index,
-					Scope:     netlink.SCOPE_UNIVERSE,
-					Dst:       ipnet,
-					Gw:        via,
-					Table:     routeTableID,
-					Src:       src,
-					Flags:     int(netlink.FLAG_ONLINK),
-					// TODO should minus vpn mtu OverHead
-					MTU: vx.vxlanIface.Attrs().MTU,
-				}
-				routes[networkutil.RouteKey(nr)] = nr
 			}
 		}
 	}

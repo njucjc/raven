@@ -17,12 +17,17 @@
 package libreswan
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
+	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/openyurtio/raven-controller-manager/pkg/ravencontroller/apis/raven/v1alpha1"
 	"github.com/vdobler/ht/errorlist"
 	"k8s.io/klog/v2"
 
@@ -54,6 +59,7 @@ const (
 )
 
 type libreswan struct {
+	mutex       sync.Mutex
 	connections map[string]*vpndriver.Connection
 	nodeName    types.NodeName
 }
@@ -81,6 +87,7 @@ func (l *libreswan) Init() error {
 
 func New(cfg *config.Config) (vpndriver.Driver, error) {
 	return &libreswan{
+		mutex:       sync.Mutex{},
 		connections: make(map[string]*vpndriver.Connection),
 		nodeName:    types.NodeName(cfg.NodeName),
 	}, nil
@@ -102,6 +109,9 @@ func (l *libreswan) Apply(network *types.Network, routeDriverMTUFn func(*types.N
 		klog.Infof("no desired connections, cleaning vpn connections")
 		return l.Cleanup()
 	}
+
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
 
 	// remove unwanted connections
 	for connName := range l.connections {
@@ -133,16 +143,106 @@ func (l *libreswan) MTU() (int, error) {
 	return mtu - IPSecEncapLen, nil
 }
 
-// getEndpointResolver returns a function that resolve the left subnets and the Endpoint that should connect to.
-func (l *libreswan) getEndpointResolver(network *types.Network) func(centralGw, remoteGw *types.Endpoint) (leftSubnets []string, connectTo *types.Endpoint) {
-	snUnderNAT := make(map[types.GatewayName][]string)
-	for _, v := range network.RemoteEndpoints {
-		if v.UnderNAT {
-			snUnderNAT[v.GatewayName] = v.Subnets
+func (l *libreswan) Healthy() bool {
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+
+	if len(l.connections) == 0 {
+		return true
+	}
+
+	activeConnectionsRx, activeConnectionsTx, err := l.retrieveActiveConnectionStats()
+	if err != nil {
+		klog.Errorf("error get active connections: %v", err)
+		return false
+	}
+
+	for name := range l.connections {
+		_, okRx := activeConnectionsRx[name]
+		_, okTx := activeConnectionsTx[name]
+		if !okRx && !okTx {
+			return false
 		}
 	}
-	return func(centralGw, remoteGw *types.Endpoint) (leftSubnets []string, connectTo *types.Endpoint) {
+	return true
+}
+
+var trafficStatusRE = regexp.MustCompile(`.* "([^"]+)"[^,]*, .*inBytes=(\d+), outBytes=(\d+).*`)
+
+func (l *libreswan) retrieveActiveConnectionStats() (map[string]int, map[string]int, error) {
+
+	// Retrieve active tunnels from the daemon
+	cmd := exec.Command("/usr/libexec/ipsec/whack", "--trafficstatus")
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, fmt.Errorf("error retrieving whack's stdout: %v", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return nil, nil, fmt.Errorf("error starting whack: %v", err)
+	}
+
+	scanner := bufio.NewScanner(stdout)
+	activeConnectionsRx := make(map[string]int)
+	activeConnectionsTx := make(map[string]int)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		matches := trafficStatusRE.FindStringSubmatch(line)
+		if matches != nil {
+			_, ok := activeConnectionsRx[matches[1]]
+			if !ok {
+				activeConnectionsRx[matches[1]] = 0
+			}
+
+			_, ok = activeConnectionsTx[matches[1]]
+			if !ok {
+				activeConnectionsTx[matches[1]] = 0
+			}
+
+			inBytes, err := strconv.Atoi(matches[2])
+			if err != nil {
+				klog.Warningf("Invalid inBytes in whack output line: %q", line)
+			} else {
+				activeConnectionsRx[matches[1]] += inBytes
+			}
+
+			outBytes, err := strconv.Atoi(matches[3])
+			if err != nil {
+				klog.Warningf("Invalid outBytes in whack output line: %q", line)
+			} else {
+				activeConnectionsTx[matches[1]] += outBytes
+			}
+		} else {
+			klog.V(5).Infof("Ignoring whack output line: %q", line)
+		}
+	}
+	if err := cmd.Wait(); err != nil {
+		return nil, nil, fmt.Errorf("error waiting for whack to complete: %v", err)
+	}
+	return activeConnectionsRx, activeConnectionsTx, nil
+}
+
+// getEndpointResolver returns a function that resolve the left subnets and the Endpoint that should connect to.
+func (l *libreswan) getEndpointResolver(network *types.Network, centralGw *types.Endpoint) func(remoteGw *types.Endpoint) (leftSubnets []string, connectTo *types.Endpoint) {
+	forwardGateways := make(map[types.GatewayName]struct{})
+	for forward := range centralGw.Forwards {
+		forwardGateways[types.GatewayName(forward.From)] = struct{}{}
+	}
+
+	snForwards := make(map[types.GatewayName][]string)
+	for _, remoteEndpoints := range network.RemoteEndpoints {
+		for _, ep := range remoteEndpoints {
+			if _, ok := forwardGateways[ep.GatewayName]; ok {
+				snForwards[ep.GatewayName] = append(snForwards[ep.GatewayName], ep.Subnets...)
+			}
+		}
+	}
+	return func(remoteGw *types.Endpoint) (leftSubnets []string, connectTo *types.Endpoint) {
 		leftSubnets = network.LocalEndpoint.Subnets
+
 		if centralGw == nil {
 			// If both local and remote gateway are NATed but no central gateway found,
 			// we cannot set up vpn connections between the local and remote gateway.
@@ -157,7 +257,7 @@ func (l *libreswan) getEndpointResolver(network *types.Network) func(centralGw, 
 				// If the local gateway is the central gateway,
 				// in order to forward traffic from other NATed gateway to the NATed remoteGw,
 				// append all subnets of other NATed gateways into left subnets.
-				for gwName, v := range snUnderNAT {
+				for gwName, v := range snForwards {
 					if gwName != remoteGw.GatewayName {
 						leftSubnets = append(leftSubnets, v...)
 					}
@@ -169,7 +269,10 @@ func (l *libreswan) getEndpointResolver(network *types.Network) func(centralGw, 
 		// If both local and remote are NATed, and the local gateway is not the central gateway,
 		// connects to central gateway to forward traffic.
 		if network.LocalEndpoint.UnderNAT && remoteGw.UnderNAT {
-			return leftSubnets, centralGw
+			if _, ok := centralGw.Forwards[v1alpha1.Forward{From: string(network.LocalEndpoint.GatewayName), To: string(remoteGw.GatewayName)}]; ok {
+				return leftSubnets, centralGw
+			}
+			return nil, nil
 		}
 
 		return leftSubnets, remoteGw
@@ -180,27 +283,39 @@ func (l *libreswan) whackConnectToEndpoint(connectionName string, connection *vp
 	args := make([]string, 0)
 	leftID := fmt.Sprintf("@%s-%s-%s", connection.LocalEndpoint.PrivateIP, connection.LocalSubnet, connection.RemoteSubnet)
 	rightID := fmt.Sprintf("@%s-%s-%s", connection.RemoteEndpoint.PrivateIP, connection.RemoteSubnet, connection.LocalSubnet)
-	//TODO Configure "--forceencaps" only when necessary.
-	//  "--forceencaps" is not necessary for endpoints that are not behind NAT device.
-	args = append(args, "--psk", "--encrypt", "--forceencaps", "--name", connectionName,
-		// local
-		"--id", leftID,
-		"--host", connection.LocalEndpoint.String(),
-		"--client", connection.LocalSubnet,
-		"--ikeport", "4500",
-
-		"--to",
-
-		// remote
-		"--id", rightID,
-		"--host", connection.RemoteEndpoint.PublicIP,
-		"--client", connection.RemoteSubnet,
-		"--ikeport", "4500")
+	// local
+	if !connection.LocalEndpoint.UnderNAT {
+		args = append(args, "--psk", "--encrypt", "--forceencaps", "--name", connectionName,
+			"--id", leftID,
+			"--host", connection.LocalEndpoint.String(),
+			"--client", connection.LocalSubnet,
+			"--ikeport", "4500",
+		)
+	} else {
+		args = append(args, "--psk", "--encrypt", "--forceencaps", "--name", connectionName,
+			"--id", leftID,
+			"--host", connection.LocalEndpoint.String(),
+			"--client", connection.LocalSubnet,
+		)
+	}
+	// remote
+	if !connection.RemoteEndpoint.UnderNAT {
+		args = append(args, "--to",
+			"--id", rightID,
+			"--host", connection.RemoteEndpoint.PublicIP,
+			"--client", connection.RemoteSubnet,
+			"--ikeport", "4500")
+	} else {
+		args = append(args, "--to",
+			"--id", rightID,
+			"--host", "%any",
+			"--client", connection.RemoteSubnet)
+	}
 
 	if err := whackCmd(args...); err != nil {
 		return err
 	}
-	if connection.LocalEndpoint.UnderNAT {
+	if connection.LocalEndpoint.UnderNAT || (!connection.LocalEndpoint.UnderNAT && !connection.RemoteEndpoint.UnderNAT) {
 		if err := whackCmd("--route", "--name", connectionName); err != nil {
 			return err
 		}
@@ -212,26 +327,32 @@ func (l *libreswan) whackConnectToEndpoint(connectionName string, connection *vp
 }
 
 func (l *libreswan) computeDesiredConnections(network *types.Network) map[string]*vpndriver.Connection {
-	centralGw := findCentralGw(network)
-	resolveEndpoint := l.getEndpointResolver(network)
+	centralGws := findCentralGw(network)
+
 	// This is the desired connection calculated from given *types.Network
 	desiredConns := make(map[string]*vpndriver.Connection)
 
 	leftEndpoint := network.LocalEndpoint
-	for _, remoteGw := range network.RemoteEndpoints {
-		leftSubnets, connectTo := resolveEndpoint(centralGw, remoteGw)
-		for _, leftSubnet := range leftSubnets {
-			for _, rightSubnet := range remoteGw.Subnets {
-				name := connectionName(leftEndpoint.PrivateIP, connectTo.PrivateIP, leftSubnet, rightSubnet)
-				desiredConns[name] = &vpndriver.Connection{
-					LocalEndpoint:  leftEndpoint.Copy(),
-					RemoteEndpoint: connectTo.Copy(),
-					LocalSubnet:    leftSubnet,
-					RemoteSubnet:   rightSubnet,
+	for _, remoteGws := range network.RemoteEndpoints {
+		for _, rightEndpoint := range remoteGws {
+			for _, centralGw := range centralGws {
+				resolveEndpoint := l.getEndpointResolver(network, centralGw)
+				leftSubnets, connectTo := resolveEndpoint(rightEndpoint)
+				for _, leftSubnet := range leftSubnets {
+					for _, rightSubnet := range rightEndpoint.Subnets {
+						name := connectionName(leftEndpoint.PrivateIP, connectTo.PrivateIP, leftSubnet, rightSubnet)
+						desiredConns[name] = &vpndriver.Connection{
+							LocalEndpoint:  leftEndpoint.Copy(),
+							RemoteEndpoint: connectTo.Copy(),
+							LocalSubnet:    leftSubnet,
+							RemoteSubnet:   rightSubnet,
+						}
+					}
 				}
 			}
 		}
 	}
+
 	return desiredConns
 }
 
@@ -262,6 +383,9 @@ func connectionName(localID, remoteID, leftSubnet, rightSubnet string) string {
 }
 
 func (l *libreswan) Cleanup() error {
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+
 	errList := errorlist.List{}
 	for name := range l.connections {
 		if err := l.whackDelConnection(name); err != nil {

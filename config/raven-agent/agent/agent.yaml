@@ -6,14 +6,14 @@ metadata:
 spec:
   selector:
     matchLabels:
-      app: raven-agent
+      raven.openyurt.io/agent: "true"
   updateStrategy:
     rollingUpdate:
       maxUnavailable: 5%
   template:
     metadata:
       labels:
-        app: raven-agent
+        raven.openyurt.io/agent: "true"
     spec:
       hostNetwork: true
       serviceAccountName: agent-account
@@ -38,3 +38,15 @@ spec:
                 configMapKeyRef:
                   name: agent-config
                   key: vpn-driver
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+              httpHeaders:
+                - name: OpenYurt-Header
+                  value: raven-agent
+            initialDelaySeconds: 10
+            timeoutSeconds: 5
+            periodSeconds: 30
+            successThreshold: 1
+            failureThreshold: 3
