@@ -1,5 +1,12 @@
 # Raven
 
+<div align="center">
+
+[![License](https://img.shields.io/badge/license-Apache%202-4EB1BA.svg)](https://www.apache.org/licenses/LICENSE-2.0.html)
+[![codecov](https://codecov.io/gh/openyurtio/raven/branch/main/graph/badge.svg)](https://codecov.io/gh/openyurtio/raven)
+
+</div>
+
 Raven is component of the OpenYurt to enhance cluster networking capabilities. This enhancement is focused on edge-edge and edge-cloud communication in OpenYurt. In short, it will provide layer 3 network connectivity among pods in different physical regions, as there are in one vanilla Kubernetes cluster.
 
 ## Architecture
