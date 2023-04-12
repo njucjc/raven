@@ -23,6 +23,7 @@ import (
 	"net"
 	"os"
 	"reflect"
+	"sync"
 	"time"
 
 	"github.com/openyurtio/openyurt/pkg/apis/raven/v1alpha1"
@@ -53,6 +54,8 @@ const (
 	PublicKey = "publicKey"
 	// KeepAliveInterval to use for wg peers.
 	KeepAliveInterval = 5 * time.Second
+	// handshakeTimeout is maximal time from handshake a connections is still considered connected.
+	handshakeTimeout = 2*time.Minute + 10*time.Second
 
 	// DeviceName specifies name of WireGuard network device.
 	DeviceName = "raven-wg0"
@@ -69,11 +72,13 @@ func init() {
 }
 
 type wireguard struct {
-	wgClient   *wgctrl.Client
-	privateKey wgtypes.Key
-	psk        wgtypes.Key
-	wgLink     netlink.Link
+	wgClient      *wgctrl.Client
+	privateKey    wgtypes.Key
+	psk           wgtypes.Key
+	wgLink        netlink.Link
+	lastSeenPeers map[string]wgtypes.Peer
 
+	mutex       sync.Mutex
 	connections map[string]*vpndriver.Connection
 	nodeName    types.NodeName
 	ravenClient client.Client
@@ -81,9 +86,11 @@ type wireguard struct {
 
 func New(cfg *config.Config) (vpndriver.Driver, error) {
 	return &wireguard{
-		connections: make(map[string]*vpndriver.Connection),
-		nodeName:    types.NodeName(cfg.NodeName),
-		ravenClient: cfg.Manager.GetClient(),
+		connections:   make(map[string]*vpndriver.Connection),
+		lastSeenPeers: make(map[string]wgtypes.Peer),
+		mutex:         sync.Mutex{},
+		nodeName:      types.NodeName(cfg.NodeName),
+		ravenClient:   cfg.Manager.GetClient(),
 	}, nil
 }
 
@@ -223,6 +230,9 @@ func (w *wireguard) Apply(network *types.Network, routeDriverMTUFn func(*types.N
 		return w.Cleanup()
 	}
 
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+
 	// 2. Ensure  WireGuard link
 	if err := w.ensureWgLink(network, routeDriverMTUFn); err != nil {
 		return fmt.Errorf("fail to ensure wireguar link: %v", err)
@@ -319,6 +329,12 @@ func (w *wireguard) MTU() (int, error) {
 }
 
 func (w *wireguard) Cleanup() error {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+
+	w.connections = make(map[string]*vpndriver.Connection)
+	w.lastSeenPeers = make(map[string]wgtypes.Peer)
+
 	errList := errorlist.List{}
 	if err := networkutil.CleanRulesOnNode(wgRouteTableID); err != nil {
 		errList = errList.Append(err)
@@ -340,7 +356,6 @@ func (w *wireguard) Cleanup() error {
 	if err = netlink.LinkDel(link); err != nil {
 		errList = errList.Append(fmt.Errorf("error delete existing wireguard device %q: %v", DeviceName, err))
 	}
-	w.connections = make(map[string]*vpndriver.Connection)
 	return errList.AsError()
 }
 
@@ -454,6 +469,59 @@ func (w *wireguard) calWgRoutes(network *types.Network) map[string]*netlink.Rout
 		}
 	}
 	return routes
+}
+
+func (w *wireguard) Healthy() bool {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+
+	if len(w.connections) == 0 {
+		return true
+	}
+
+	d, err := w.wgClient.Device(DeviceName)
+	if err != nil {
+		klog.Errorf("failed to find device %s: %v", DeviceName, err)
+		return false
+	}
+
+	peers := make(map[string]wgtypes.Peer)
+	for _, p := range d.Peers {
+		peers[p.PublicKey.String()] = p
+	}
+
+	defer func() {
+		w.lastSeenPeers = peers
+	}()
+
+	for _, v := range w.connections {
+		p, ok := peers[keyFromEndpoint(v.RemoteEndpoint).String()]
+		if !ok {
+			return false
+		}
+		if !w.isPeerActive(&p) {
+			return false
+		}
+	}
+	return true
+}
+
+func (w *wireguard) isPeerActive(p *wgtypes.Peer) bool {
+	if lastSeenPeer, ok := w.lastSeenPeers[p.PublicKey.String()]; ok {
+		rx := p.ReceiveBytes - lastSeenPeer.ReceiveBytes
+		tx := p.TransmitBytes - lastSeenPeer.TransmitBytes
+		if rx > 0 || tx > 0 {
+			return true
+		}
+	}
+
+	if p.LastHandshakeTime.IsZero() {
+		return false
+	}
+	if time.Since(p.LastHandshakeTime) > handshakeTimeout {
+		return false
+	}
+	return true
 }
 
 func connectionName(localNodeName, remoteNodeName string) string {

@@ -19,6 +19,10 @@ import (
 	"github.com/openyurtio/raven/pkg/networkengine/vpndriver/libreswan"
 )
 
+const (
+	defaultProbeAddr = ":8081"
+)
+
 // AgentOptions has the information that required by the raven agent
 type AgentOptions struct {
 	NodeName      string
@@ -39,7 +43,7 @@ func (o *AgentOptions) Validate() error {
 	return nil
 }
 
-// AddFlags returns flags for a specific yurttunnel-agent by section name
+// AddFlags returns flags for a specific raven-agent by section name
 func (o *AgentOptions) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&o.NodeName, "node-name", o.NodeName, "The name of the node.")
 	fs.StringVar(&o.Kubeconfig, "kubeconfig", o.Kubeconfig, "Path to the kubeconfig file.")

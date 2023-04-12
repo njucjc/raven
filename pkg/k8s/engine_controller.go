@@ -19,6 +19,7 @@ package k8s
 import (
 	"context"
 	"net"
+	"net/http"
 	"reflect"
 	"time"
 
@@ -97,6 +98,19 @@ func (c *EngineController) Start(ctx context.Context) {
 	go func() {
 		if err := c.manager.Start(ctx); err != nil {
 			klog.ErrorS(err, "failed to start engine controller")
+		}
+	}()
+	go func() {
+		http.HandleFunc("/healthz", func(writer http.ResponseWriter, request *http.Request) {
+			if c.vpnDriver.Healthy() {
+				writer.WriteHeader(200)
+			} else {
+				writer.WriteHeader(500)
+			}
+		})
+		if err := http.ListenAndServe(":8081", nil); err != nil {
+			klog.Errorf("failed to start healthz http server: %v", err)
+			return
 		}
 	}()
 	go wait.Until(c.worker, time.Second, ctx.Done())

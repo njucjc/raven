@@ -30,6 +30,8 @@ type Driver interface {
 	Apply(network *types.Network, routeDriverMTU func(*types.Network) (int, error)) error
 	// MTU return Minimal MTU in vpn driver
 	MTU() (int, error)
+
+	Healthy() bool
 	// Cleanup performs the necessary uninstallation.
 	Cleanup() error
 }

@@ -80,8 +80,6 @@ spec:
   endpoints:
     - nodeName: hhht-node1
       underNAT: true
-    - nodeName: hhht-node2
-      underNAT: true
       
 ---
 apiVersion: raven.openyurt.io/v1alpha1
@@ -102,11 +100,11 @@ spec:
   endpoints:
     - nodeName: wlcb-node1
       underNAT: true
-    - nodeName: wlcb-node2
-      underNAT: true
 
 EOF
 ```
+
+NOTE: Only candidate gateway node should be entered to endpoints slice in `Gateway CR`.
 
 - 2 Get gateways
 

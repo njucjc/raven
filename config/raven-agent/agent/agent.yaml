@@ -21,6 +21,18 @@ spec:
         - name: raven-agent
           image: raven-agent:latest
           imagePullPolicy: Always
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+              httpHeaders:
+                - name: X-Raven-Header
+                  value: Awesome
+            initialDelaySeconds: 10
+            timeoutSeconds: 5
+            periodSeconds: 30
+            successThreshold: 1
+            failureThreshold: 3
           securityContext:
             privileged: true
           env:

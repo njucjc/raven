@@ -17,9 +17,13 @@
 package libreswan
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
+	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -54,6 +58,7 @@ const (
 )
 
 type libreswan struct {
+	mutex       sync.Mutex
 	connections map[string]*vpndriver.Connection
 	nodeName    types.NodeName
 }
@@ -81,6 +86,7 @@ func (l *libreswan) Init() error {
 
 func New(cfg *config.Config) (vpndriver.Driver, error) {
 	return &libreswan{
+		mutex:       sync.Mutex{},
 		connections: make(map[string]*vpndriver.Connection),
 		nodeName:    types.NodeName(cfg.NodeName),
 	}, nil
@@ -102,6 +108,9 @@ func (l *libreswan) Apply(network *types.Network, routeDriverMTUFn func(*types.N
 		klog.Infof("no desired connections, cleaning vpn connections")
 		return l.Cleanup()
 	}
+
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
 
 	// remove unwanted connections
 	for connName := range l.connections {
@@ -131,6 +140,30 @@ func (l *libreswan) MTU() (int, error) {
 		return 0, err
 	}
 	return mtu - IPSecEncapLen, nil
+}
+
+func (l *libreswan) Healthy() bool {
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+
+	if len(l.connections) == 0 {
+		return true
+	}
+
+	activeConnectionsRx, activeConnectionsTx, err := l.retrieveActiveConnectionStats()
+	if err != nil {
+		klog.Errorf("error get active connections: %v", err)
+		return false
+	}
+
+	for name := range l.connections {
+		_, okRx := activeConnectionsRx[name]
+		_, okTx := activeConnectionsTx[name]
+		if !okRx && !okTx {
+			return false
+		}
+	}
+	return true
 }
 
 // getEndpointResolver returns a function that resolve the left subnets and the Endpoint that should connect to.
@@ -276,6 +309,9 @@ func connectionName(localID, remoteID, leftSubnet, rightSubnet string) string {
 }
 
 func (l *libreswan) Cleanup() error {
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+
 	errList := errorlist.List{}
 	for name := range l.connections {
 		if err := l.whackDelConnection(name); err != nil {
@@ -337,4 +373,62 @@ func (l *libreswan) connectToEndpoint(name string, connection *vpndriver.Connect
 	}
 	l.connections[name] = connection
 	return errList
+}
+
+var trafficStatusRE = regexp.MustCompile(`.* "([^"]+)"[^,]*, .*inBytes=(\d+), outBytes=(\d+).*`)
+
+func (l *libreswan) retrieveActiveConnectionStats() (map[string]int, map[string]int, error) {
+
+	// Retrieve active tunnels from the daemon
+	cmd := exec.Command("/usr/libexec/ipsec/whack", "--trafficstatus")
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, fmt.Errorf("error retrieving whack's stdout: %v", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return nil, nil, fmt.Errorf("error starting whack: %v", err)
+	}
+
+	scanner := bufio.NewScanner(stdout)
+	activeConnectionsRx := make(map[string]int)
+	activeConnectionsTx := make(map[string]int)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		matches := trafficStatusRE.FindStringSubmatch(line)
+		if matches != nil {
+			_, ok := activeConnectionsRx[matches[1]]
+			if !ok {
+				activeConnectionsRx[matches[1]] = 0
+			}
+
+			_, ok = activeConnectionsTx[matches[1]]
+			if !ok {
+				activeConnectionsTx[matches[1]] = 0
+			}
+
+			inBytes, err := strconv.Atoi(matches[2])
+			if err != nil {
+				klog.Warningf("Invalid inBytes in whack output line: %q", line)
+			} else {
+				activeConnectionsRx[matches[1]] += inBytes
+			}
+
+			outBytes, err := strconv.Atoi(matches[3])
+			if err != nil {
+				klog.Warningf("Invalid outBytes in whack output line: %q", line)
+			} else {
+				activeConnectionsTx[matches[1]] += outBytes
+			}
+		} else {
+			klog.V(5).Infof("Ignoring whack output line: %q", line)
+		}
+	}
+	if err := cmd.Wait(); err != nil {
+		return nil, nil, fmt.Errorf("error waiting for whack to complete: %v", err)
+	}
+	return activeConnectionsRx, activeConnectionsTx, nil
 }

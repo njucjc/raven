@@ -29,6 +29,19 @@ podSecurityContext: {}
 securityContext:
   privileged: true
 
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 8081
+    httpHeaders:
+      - name: X-Raven-Header
+        value: Awesome
+  initialDelaySeconds: 10
+  timeoutSeconds: 5
+  periodSeconds: 30
+  successThreshold: 1
+  failureThreshold: 3
+
 nodeSelector:
   kubernetes.io/arch: amd64
   kubernetes.io/os: linux
