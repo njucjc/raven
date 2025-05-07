@@ -3,11 +3,14 @@
 IMG ?= openyurt/raven-agent:latest
 VPN_DRIVER ?= libreswan
 FORWARD_NODE_IP ?= false
+NAT_TRAVERSAL ?= false
 METRIC_BIND_ADDR ?= ":8080"
 
 BUILDPLATFORM ?= linux/amd64
 TARGETOS ?= linux
 TARGETARCH ?= amd64
+
+GITCOMMIT = $(shell git rev-parse HEAD)
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -57,7 +60,7 @@ run: fmt vet ## Run a controller from your host.
 	go run cmd/agent/main.go
 
 docker-build:## Build docker image with the agent.
-	docker build --platform=${BUILDPLATFORM} --build-arg TARGETOS=${TARGETOS} --build-arg TARGETARCH=${TARGETARCH} -t ${IMG} .
+	docker build --platform=${BUILDPLATFORM} --build-arg TARGETOS=${TARGETOS} --build-arg TARGETARCH=${TARGETARCH} --build-arg GITCOMMIT=${GITCOMMIT} -t ${IMG} .
 
 docker-push: ## Push docker image with the agent.
 	docker push ${IMG}
@@ -65,7 +68,7 @@ docker-push: ## Push docker image with the agent.
 ##@ Deploy
 
 gen-deploy-yaml:
-	bash hack/gen-yaml.sh ${IMG} ${VPN_DRIVER} ${FORWARD_NODE_IP} ${METRIC_BIND_ADDR}
+	bash hack/gen-yaml.sh ${IMG} ${VPN_DRIVER} ${FORWARD_NODE_IP} ${METRIC_BIND_ADDR} ${NAT_TRAVERSAL}
 
 deploy: gen-deploy-yaml ## Deploy agent daemon.
 	kubectl apply -f _output/yamls/raven-agent.yaml

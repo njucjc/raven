@@ -17,26 +17,36 @@
 package config
 
 import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 )
 
 // Config is the main context object for raven agent
 type Config struct {
-	NodeName           string
-	NodeIP             string
+	NodeName   string
+	NodeIP     string
+	SyncRules  bool
+	SyncPeriod metav1.Duration
+
 	MetricsBindAddress string
-	KubeConfig         *rest.Config
-	Manager            manager.Manager
-	Tunnel             *TunnelConfig
-	Proxy              *ProxyConfig
+	HealthProbeAddr    string
+
+	KubeConfig *rest.Config
+	Manager    manager.Manager
+	Tunnel     *TunnelConfig
+	Proxy      *ProxyConfig
 }
 
 type TunnelConfig struct {
-	VPNDriver     string
-	VPNPort       string
-	RouteDriver   string
-	ForwardNodeIP bool
+	VPNDriver         string
+	VPNPort           string
+	RouteDriver       string
+	MACPrefix         string
+	ForwardNodeIP     bool
+	NATTraversal      bool
+	KeepAliveInterval int
+	KeepAliveTimeout  int
 }
 
 type ProxyConfig struct {

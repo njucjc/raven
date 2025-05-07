@@ -22,7 +22,9 @@ import (
 	"math"
 	"net"
 	"os"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/vdobler/ht/errorlist"
 	"github.com/vishvananda/netlink"
@@ -35,7 +37,6 @@ import (
 	ipsetutil "github.com/openyurtio/raven/pkg/networkengine/util/ipset"
 	iptablesutil "github.com/openyurtio/raven/pkg/networkengine/util/iptables"
 	"github.com/openyurtio/raven/pkg/types"
-	"github.com/openyurtio/raven/pkg/utils"
 )
 
 const (
@@ -52,7 +53,8 @@ const (
 
 	ravenMark = 0x40
 
-	ravenMarkSet = "raven-mark-set"
+	ravenMarkSet     = "raven-mark-set"
+	ravenMarkSetType = "hash:net"
 )
 
 var (
@@ -67,6 +69,7 @@ func init() {
 type vxlan struct {
 	vxlanIface netlink.Link
 	nodeName   types.NodeName
+	macPrefix  string
 
 	iptables iptablesutil.IPTablesInterface
 	ipset    ipsetutil.IPSetInterface
@@ -74,11 +77,11 @@ type vxlan struct {
 
 func (vx *vxlan) Apply(network *types.Network, vpnDriverMTUFn func() (int, error)) (err error) {
 	if network.LocalEndpoint == nil || len(network.RemoteEndpoints) == 0 {
-		klog.Info(utils.FormatTunnel("no local gateway or remote gateway is found, cleaning up route setting"))
+		klog.Info("no local gateway or remote gateway is found, cleaning up route setting")
 		return vx.Cleanup()
 	}
 	if len(network.LocalNodeInfo) == 1 {
-		klog.Infof(utils.FormatTunnel("only gateway node exist in current gateway, cleaning up route setting"))
+		klog.Info("only gateway node exist in current gateway, cleaning up route setting")
 		return vx.Cleanup()
 	}
 
@@ -91,14 +94,17 @@ func (vx *vxlan) Apply(network *types.Network, vpnDriverMTUFn func() (int, error
 	var desiredRules, currentRules map[string]*netlink.Rule
 
 	// The desired and current FDB entries calculated from given network.
-	// The key is netlink.Neigh.IP
+	// The key is NeighKey()
 	var desiredFDBs, currentFDBs map[string]*netlink.Neigh
+
+	// The desired and current ARP entries calculated from given network.
+	// The key is NeighKey()
+	var desiredARPs, currentARPs map[string]*netlink.Neigh
 
 	// The desired and current ipset entries calculated from given network.
 	// The key is ip set entry
 	var desiredSet, currentSet map[string]*netlink.IPSetEntry
-
-	vx.ipset, err = ipsetutil.New(ravenMarkSet)
+	vx.ipset, err = ipsetutil.New(ravenMarkSet, ravenMarkSetType, ipsetutil.IpsetWrapperOption{})
 	if err != nil {
 		return fmt.Errorf("error create ip set: %s", err)
 	}
@@ -127,6 +133,11 @@ func (vx *vxlan) Apply(network *types.Network, vpnDriverMTUFn func() (int, error
 		return fmt.Errorf("error listing fdb on node: %s", err)
 	}
 
+	currentARPs, err = networkutil.ListARPsOnNode(vx.vxlanIface)
+	if err != nil {
+		return fmt.Errorf("error listing arp on node: %s", err)
+	}
+
 	currentSet, err = networkutil.ListIPSetOnNode(vx.ipset)
 	if err != nil {
 		return fmt.Errorf("error listing ip set on node: %s", err)
@@ -137,8 +148,14 @@ func (vx *vxlan) Apply(network *types.Network, vpnDriverMTUFn func() (int, error
 
 	if vx.isGatewayRole(network) {
 		desiredRoutes = vx.calRouteOnGateway(network)
-		desiredFDBs = vx.calFDBOnGateway(network)
-
+		desiredFDBs, err = vx.calFDBOnGateway(network)
+		if err != nil {
+			return fmt.Errorf("error calculate gateway fdb: %s", err)
+		}
+		desiredARPs, err = vx.calARPOnGateway(network)
+		if err != nil {
+			return fmt.Errorf("error calculate gateway arp: %s", err)
+		}
 		err = vx.deleteChainRuleOnNode(iptablesutil.MangleTable, iptablesutil.RavenMarkChain, nonGatewayChainRuleSpec)
 		if err != nil {
 			return fmt.Errorf("error deleting non gateway chain rule: %s", err)
@@ -149,8 +166,14 @@ func (vx *vxlan) Apply(network *types.Network, vpnDriverMTUFn func() (int, error
 		}
 	} else {
 		desiredRoutes = vx.calRouteOnNonGateway(network)
-		desiredFDBs = vx.calFDBOnNonGateway(network)
-
+		desiredFDBs, err = vx.calFDBOnNonGateway(network)
+		if err != nil {
+			return fmt.Errorf("error calculate non gateway fdb: %s", err)
+		}
+		desiredARPs, err = vx.calARPOnNonGateway(network)
+		if err != nil {
+			return fmt.Errorf("error calculate non gateway arp: %s", err)
+		}
 		err = vx.deleteChainRuleOnNode(iptablesutil.MangleTable, iptablesutil.RavenMarkChain, gatewayChainRuleSpec)
 		if err != nil {
 			return fmt.Errorf("error deleting gateway chain rule: %s", err)
@@ -172,6 +195,10 @@ func (vx *vxlan) Apply(network *types.Network, vpnDriverMTUFn func() (int, error
 	err = networkutil.ApplyFDBs(currentFDBs, desiredFDBs)
 	if err != nil {
 		return fmt.Errorf("error applying fdb: %s", err)
+	}
+	err = networkutil.ApplyARPs(currentARPs, desiredARPs)
+	if err != nil {
+		return fmt.Errorf("error applying arp: %s", err)
 	}
 	err = networkutil.ApplyIPSet(vx.ipset, currentSet, desiredSet)
 	if err != nil {
@@ -218,7 +245,8 @@ func (vx *vxlan) nodeInfo(network *types.Network) *v1beta1.NodeInfo {
 
 func New(cfg *config.Config) (routedriver.Driver, error) {
 	return &vxlan{
-		nodeName: types.NodeName(cfg.NodeName),
+		nodeName:  types.NodeName(cfg.NodeName),
+		macPrefix: cfg.Tunnel.MACPrefix,
 	}, nil
 }
 
@@ -228,7 +256,7 @@ func (vx *vxlan) Init() (err error) {
 		return err
 	}
 
-	vx.ipset, err = ipsetutil.New(ravenMarkSet)
+	vx.ipset, err = ipsetutil.New(ravenMarkSet, ravenMarkSetType, ipsetutil.IpsetWrapperOption{})
 	if err != nil {
 		return err
 	}
@@ -271,15 +299,20 @@ func (vx *vxlan) ensureVxlanLink(network *types.Network, vpnDriverMTUFn func() (
 			}(vpnDriverMTU, routeDriverMTU),
 			Flags: net.FlagUp,
 		},
-		VxlanId: vxlanID,
-		Age:     300,
-		Port:    vxlanPort,
+		VxlanId:  vxlanID,
+		Age:      300,
+		Port:     vxlanPort,
+		Learning: false,
 	}
 	if !vx.isGatewayRole(network) {
 		vxlanLink.Group = net.ParseIP(network.LocalEndpoint.PrivateIP)
 	}
 
 	localIP := net.ParseIP(vx.nodeInfo(network).PrivateIP)
+	vxlanLink.HardwareAddr, err = vx.ipAddrToHardwareAddr(localIP)
+	if err != nil {
+		return fmt.Errorf("error convert vxlan ip to mac address: %s", err)
+	}
 	nl, err := ensureVxlanLink(vxlanLink, vxlanIP(localIP))
 	if err != nil {
 		return fmt.Errorf("error ensuring vxlan link: %s", err)
@@ -382,42 +415,95 @@ func (vx *vxlan) calRulesOnNode() map[string]*netlink.Rule {
 // calFDBOnGateway calculates and returns the desired FDB entries on gateway node.
 // The FDB entries format are equivalent to the following `bridge fdb append` command:
 //
-//	bridge fdb append 00:00:00:00:00:00 dev raven0 dst {non_gateway_nodeN_private_ip} self permanent
-func (vx *vxlan) calFDBOnGateway(network *types.Network) map[string]*netlink.Neigh {
+//	bridge fdb append fixed mac address dev raven0 dst {non_gateway_nodeN_private_ip} self permanent
+func (vx *vxlan) calFDBOnGateway(network *types.Network) (map[string]*netlink.Neigh, error) {
 	fdbs := make(map[string]*netlink.Neigh)
 	for k, v := range network.LocalNodeInfo {
 		if vx.nodeName == k {
 			continue
 		}
-		fdbs[v.PrivateIP] = &netlink.Neigh{
+		HardwareAddr, err := vx.ipAddrToHardwareAddr(net.ParseIP(v.PrivateIP))
+		if err != nil {
+			return nil, fmt.Errorf("convert ip address %s to hardware address error %s", v.PrivateIP, err.Error())
+		}
+		nh := &netlink.Neigh{
 			LinkIndex:    vx.vxlanIface.Attrs().Index,
 			State:        netlink.NUD_PERMANENT | netlink.NUD_NOARP,
 			Type:         netlink.NDA_DST,
 			Family:       syscall.AF_BRIDGE,
 			Flags:        netlink.NTF_SELF,
 			IP:           net.ParseIP(v.PrivateIP),
-			HardwareAddr: networkutil.AllZeroMAC,
+			HardwareAddr: HardwareAddr,
 		}
+		fdbs[networkutil.NeighKey(nh)] = nh
 	}
-	return fdbs
+	return fdbs, nil
 }
 
 // calFDBOnNonGateway calculates and returns the desired FDB entries on non-gateway node.
 // The FDB entries format are equivalent to the following `bridge fdb append` command:
 //
-//	bridge fdb append 00:00:00:00:00:00 dev raven0 dst {gateway_node_private_ip} self permanent
-func (vx *vxlan) calFDBOnNonGateway(network *types.Network) map[string]*netlink.Neigh {
-	return map[string]*netlink.Neigh{
-		network.LocalEndpoint.PrivateIP: {
-			LinkIndex:    vx.vxlanIface.Attrs().Index,
-			State:        netlink.NUD_PERMANENT | netlink.NUD_NOARP,
-			Type:         netlink.NDA_DST,
-			Family:       syscall.AF_BRIDGE,
-			Flags:        netlink.NTF_SELF,
-			IP:           net.ParseIP(network.LocalEndpoint.PrivateIP),
-			HardwareAddr: networkutil.AllZeroMAC,
-		},
+//	bridge fdb append fixed mac address dev raven0 dst {gateway_node_private_ip} self permanent
+func (vx *vxlan) calFDBOnNonGateway(network *types.Network) (map[string]*netlink.Neigh, error) {
+	HardwareAddr, err := vx.ipAddrToHardwareAddr(net.ParseIP(network.LocalEndpoint.PrivateIP))
+	if err != nil {
+		return nil, fmt.Errorf("convert ip address %s to hardware address error %s", network.LocalEndpoint.PrivateIP, err.Error())
 	}
+	nh := &netlink.Neigh{
+		LinkIndex:    vx.vxlanIface.Attrs().Index,
+		State:        netlink.NUD_PERMANENT | netlink.NUD_NOARP,
+		Type:         netlink.NDA_DST,
+		Family:       syscall.AF_BRIDGE,
+		Flags:        netlink.NTF_SELF,
+		IP:           net.ParseIP(network.LocalEndpoint.PrivateIP),
+		HardwareAddr: HardwareAddr,
+	}
+	return map[string]*netlink.Neigh{networkutil.NeighKey(nh): nh}, nil
+}
+
+// calARPOnGateway calculates and returns the desired ARP entries on gateway node.
+// The ARP entries format are equivalent to the following `ip neigh` command:
+func (vx *vxlan) calARPOnGateway(network *types.Network) (map[string]*netlink.Neigh, error) {
+	arps := make(map[string]*netlink.Neigh)
+	for k, v := range network.LocalNodeInfo {
+		if vx.nodeName == k {
+			continue
+		}
+		HardwareAddr, err := vx.ipAddrToHardwareAddr(net.ParseIP(v.PrivateIP))
+		if err != nil {
+			return nil, fmt.Errorf("convert ip address %s to hardware address error %s", v.PrivateIP, err.Error())
+		}
+		nh := &netlink.Neigh{
+			LinkIndex:    vx.vxlanIface.Attrs().Index,
+			State:        netlink.NUD_PERMANENT,
+			Type:         netlink.NDA_DST,
+			Family:       syscall.AF_INET,
+			Flags:        netlink.NTF_SELF,
+			IP:           vxlanIP(net.ParseIP(v.PrivateIP)),
+			HardwareAddr: HardwareAddr,
+		}
+		arps[networkutil.NeighKey(nh)] = nh
+	}
+	return arps, nil
+}
+
+// calARPOnNonGateway calculates and returns the desired ARP entries on non-gateway node.
+// The ARP entries format are equivalent to the following `ip neigh` command:
+func (vx *vxlan) calARPOnNonGateway(network *types.Network) (map[string]*netlink.Neigh, error) {
+	HardwareAddr, err := vx.ipAddrToHardwareAddr(net.ParseIP(network.LocalEndpoint.PrivateIP))
+	if err != nil {
+		return nil, fmt.Errorf("convert ip address %s to hardware address error %s", network.LocalEndpoint.PrivateIP, err.Error())
+	}
+	nh := &netlink.Neigh{
+		LinkIndex:    vx.vxlanIface.Attrs().Index,
+		State:        netlink.NUD_PERMANENT,
+		Type:         netlink.NDA_DST,
+		Family:       syscall.AF_INET,
+		Flags:        netlink.NTF_SELF,
+		IP:           vxlanIP(net.ParseIP(network.LocalEndpoint.PrivateIP)),
+		HardwareAddr: HardwareAddr,
+	}
+	return map[string]*netlink.Neigh{networkutil.NeighKey(nh): nh}, nil
 }
 
 // calIPSetOnNonGateway calculates and returns the desired ip set entries on non-gateway node.
@@ -433,14 +519,18 @@ func (vx *vxlan) calIPSetOnNode(network *types.Network) map[string]*netlink.IPSe
 			continue
 		}
 		for _, srcCIDR := range nodeInfo.Subnets {
-			_, ipNet, _ := net.ParseCIDR(srcCIDR)
+			_, ipNet, err := net.ParseCIDR(srcCIDR)
+			if err != nil {
+				klog.Errorf("parse node subnet %s error %s", srcCIDR, err.Error())
+				continue
+			}
 			ones, _ := ipNet.Mask.Size()
 			entry := &netlink.IPSetEntry{
 				IP:      ipNet.IP,
 				CIDR:    uint8(ones),
 				Replace: true,
 			}
-			set[ipsetutil.SetEntryKey(entry)] = entry
+			set[vx.ipset.Key(entry)] = entry
 		}
 	}
 	return set
@@ -479,14 +569,16 @@ func (vx *vxlan) Cleanup() error {
 	}
 
 	// Clean may be called more than one time, so we should ensure ip set exists
-	vx.ipset, err = ipsetutil.New(ravenMarkSet)
+	vx.ipset, err = ipsetutil.New(ravenMarkSet, ravenMarkSetType, ipsetutil.IpsetWrapperOption{})
 	if err != nil {
 		errList = errList.Append(fmt.Errorf("error ensure ip set %s: %s", ravenMarkSet, err))
 	}
+	time.Sleep(time.Second)
 	err = vx.ipset.Flush()
 	if err != nil {
 		errList = errList.Append(fmt.Errorf("error flushing ipset: %s", err))
 	}
+	time.Sleep(time.Second)
 	err = vx.ipset.Destroy()
 	if err != nil {
 		errList = errList.Append(fmt.Errorf("error destroying ipset: %s", err))
@@ -520,4 +612,17 @@ func (vx *vxlan) isGatewayRole(network *types.Network) bool {
 	return network != nil &&
 		network.LocalEndpoint != nil &&
 		network.LocalEndpoint.NodeName == vx.nodeName
+}
+
+func (vx *vxlan) ipAddrToHardwareAddr(ip net.IP) (net.HardwareAddr, error) {
+	macSlice := []string{vx.macPrefix}
+	for _, ipSlice := range vxlanIP(ip).To4() {
+		macSlice = append(macSlice, fmt.Sprintf("%02x", ipSlice))
+	}
+	macStr := strings.Join(macSlice, ":")
+	macAddr, err := net.ParseMAC(macStr)
+	if err != nil {
+		return nil, fmt.Errorf("parse MAC %s error %s", macStr, err.Error())
+	}
+	return macAddr, nil
 }

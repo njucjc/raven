@@ -25,7 +25,6 @@ import (
 
 	iptablesutil "github.com/openyurtio/raven/pkg/networkengine/util/iptables"
 	netlinkutil "github.com/openyurtio/raven/pkg/networkengine/util/netlink"
-	"github.com/openyurtio/raven/pkg/networkengine/vpndriver"
 	"github.com/openyurtio/raven/pkg/types"
 )
 
@@ -130,7 +129,7 @@ func TestLibreswan_Apply(t *testing.T) {
 			nodeName: "localGwNode",
 			// It is unable to set up any vpn connections in such case and should clean up vpn connections
 			expectedConnName: map[string]struct{}{},
-			shouldCleanup:    true,
+			shouldCleanup:    false,
 			network: &types.Network{
 				LocalEndpoint: &types.Endpoint{
 					GatewayName: "localGw",
@@ -372,7 +371,7 @@ func TestLibreswan_Apply(t *testing.T) {
 			whackCmd = w.whackCmd
 			a := assert.New(t)
 			l := &libreswan{
-				connections: make(map[string]*vpndriver.Connection),
+				connections: make(map[string]bool),
 				nodeName:    types.NodeName(v.nodeName),
 			}
 			var err error

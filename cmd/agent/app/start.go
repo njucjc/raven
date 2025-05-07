@@ -19,15 +19,17 @@ package app
 import (
 	"context"
 	"fmt"
+	"sync"
+	"time"
 
 	"github.com/lorenzosaino/go-sysctl"
+	"github.com/spf13/cobra"
 	"k8s.io/klog/v2"
 
 	"github.com/openyurtio/raven/cmd/agent/app/config"
 	"github.com/openyurtio/raven/cmd/agent/app/options"
 	ravenengine "github.com/openyurtio/raven/pkg/engine"
 	"github.com/openyurtio/raven/pkg/features"
-	"github.com/spf13/cobra"
 )
 
 // NewRavenAgentCommand creates a new raven agent command
@@ -58,18 +60,49 @@ func NewRavenAgentCommand(ctx context.Context) *cobra.Command {
 
 // Run starts the raven-agent
 func Run(ctx context.Context, cfg *config.CompletedConfig) error {
-	klog.Info("Start raven agent")
-	defer klog.Info("Stop raven agent")
 	if err := disableICMPRedirect(); err != nil {
 		return err
 	}
-	engine := ravenengine.NewEngine(ctx, cfg.Config)
+	if err := disableICMPRpFilter(); err != nil {
+		return err
+	}
+	engine, err := ravenengine.NewEngine(ctx, cfg.Config)
+	if err != nil {
+		return err
+	}
+	klog.Info("engine successfully start")
 	engine.Start()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		<-ctx.Done()
+		time.Sleep(time.Second)
+		engine.Cleanup()
+		wg.Done()
+	}()
+	wg.Wait()
 	return nil
 }
 
 func disableICMPRedirect() error {
 	obj := "net.ipv4.conf.all.send_redirects"
+	val, err := sysctl.Get(obj)
+	if err != nil {
+		klog.ErrorS(err, "failed to sysctl get", obj)
+		return err
+	}
+	if val != "0" {
+		err = sysctl.Set(obj, "0")
+		if err != nil {
+			klog.ErrorS(err, "failed to sysctl set", obj)
+			return err
+		}
+	}
+	return nil
+}
+
+func disableICMPRpFilter() error {
+	obj := "net.ipv4.conf.default.rp_filter"
 	val, err := sysctl.Get(obj)
 	if err != nil {
 		klog.ErrorS(err, "failed to sysctl get", obj)

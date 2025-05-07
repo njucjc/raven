@@ -20,6 +20,26 @@ spec:
       - image: {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
         imagePullPolicy: {{ .Values.image.pullPolicy }}
         name: raven-agent
+        livenessProbe:
+          failureThreshold: 10
+          httpGet:
+            path: /healthz
+            port: 10275
+            scheme: HTTP
+          initialDelaySeconds: 20
+          periodSeconds: 30
+          successThreshold: 1
+          timeoutSeconds: 15
+        readinessProbe:
+          failureThreshold: 10
+          httpGet:
+            path: /readyz
+            port: 10275
+            scheme: HTTP
+          initialDelaySeconds: 20
+          periodSeconds: 30
+          successThreshold: 1
+          timeoutSeconds: 15
         securityContext:
           {{- toYaml .Values.securityContext | nindent 12 }}
         {{- with .Values.containerEnv }}
@@ -30,13 +50,21 @@ spec:
           - --v=2
           - --vpn-driver={{.Values.vpn.driver}}
           - --forward-node-ip={{.Values.vpn.forwardNodeIP}}
+          - --nat-traversal={{.Values.vpn.natTraversal}}
           - --metric-bind-addr={{.Values.vpn.metricBindAddr}}
+          - --health-probe-addr={{.Values.healthyBindAddr}}
           - --vpn-bind-port={{.Values.vpn.tunnelAddr}}
+          - --keep-alive-interval={{.Values.vpn.keepAliveInterval}}
+          - --keep-alive-timeout={{.Values.vpn.keepAliveTimeout}}
+          - --sync-raven-rules={{.Values.sync.syncRule}}
+          - --sync-raven-rules-period={{.Values.sync.syncPeriod}}
           - --proxy-metric-bind-addr={{.Values.proxy.metricsBindAddr}}
           - --proxy-internal-secure-addr={{.Values.proxy.internalSecureAddr}}
           - --proxy-internal-insecure-addr={{.Values.proxy.internalInsecureAddr}}
           - --proxy-external-addr={{.Values.proxy.externalAddr}}
-
+        volumeMounts:
+        - name: raven-dir
+          mountPath: /var/lib/raven
       hostNetwork: true
       {{- with .Values.nodeSelector }}
       nodeSelector:
@@ -47,6 +75,11 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      volumes:
+      - name: raven-dir
+        hostPath:
+          path: /var/lib/raven
+          type: DirectoryOrCreate
   updateStrategy:
     rollingUpdate:
       maxUnavailable: {{ .Values.rollingUpdate.maxUnavailable }}

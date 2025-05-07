@@ -67,20 +67,21 @@ func NewHeaderManager(client client.Client, gatewayName string, isIPv4 bool) Wra
 func (h *headerManger) Handler(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r == nil {
-			klog.Errorf(utils.FormatProxyServer("request is nil, skip it"))
+			klog.Errorf("request is nil, skip it")
 			return
 		}
 		oldHost := r.Host
-		klog.Info(utils.FormatProxyServer("request with host %s and url %s is processed by header manager", oldHost, r.URL.String()))
 		var host, ip, port string
 		var err error
 		if isAPIServerRequest(r) {
+			klog.Infof("request from apiserver with host %s and url %s is processed by header manager", oldHost, r.URL.String())
 			host, ip, port, err = h.getAPIServerRequestDestAddress(r)
 			if err != nil {
 				logAndHTTPError(w, http.StatusBadRequest, "request host %s and url %s is invalid, %s", r.Host, r.URL.String(), err.Error())
 				return
 			}
 		} else {
+			klog.Infof("normal request with host %s and url %s is processed by header manager", oldHost, r.URL.String())
 			host, ip, port, err = h.getNormalRequestDestAddress(r)
 			if err != nil {
 				logAndHTTPError(w, http.StatusBadRequest, "request host %s and url %s is invalid, %s", r.Host, r.URL.String(), err.Error())
@@ -116,11 +117,11 @@ func (h *headerManger) Handler(handler http.Handler) http.Handler {
 		metrics.Metrics.IncInFlightRequests(r.Method, r.URL.Path)
 		defer metrics.Metrics.DecInFlightRequests(r.Method, r.URL.Path)
 
-		klog.Infoln(utils.FormatProxyServer("start handling request %s %s, req.Host changed from %s to %s, remote address is %s",
-			r.Method, r.URL.String(), oldHost, r.Host, r.RemoteAddr))
+		klog.Infof("start handling request %s %s, req.Host changed from %s to %s, remote address is %s",
+			r.Method, r.URL.String(), oldHost, r.Host, r.RemoteAddr)
 		start := time.Now()
 		handler.ServeHTTP(w, r)
-		klog.Infoln(utils.FormatProxyServer("finish handle request %s %s, handle lasts %v", r.Method, r.URL.String(), time.Since(start)))
+		klog.Infof("finish handle request %s %s, handle lasts %v", r.Method, r.URL.String(), time.Since(start))
 	})
 }
 
@@ -144,8 +145,7 @@ func (h *headerManger) getAPIServerRequestDestAddress(r *http.Request) (name, ip
 	}
 	name, err = h.getGatewayNodeName(&node)
 	if err != nil {
-		return "", "", "", fmt.Errorf("gateway include node %s, has no active endpoints, error %s",
-			node.Name, err.Error())
+		return "", "", "", fmt.Errorf("can not find gateway node for node %s, error %s", node.Name, err.Error())
 	}
 	ip = getNodeIP(&node)
 	if ip == "" {
@@ -159,17 +159,17 @@ func (h *headerManger) getAPIServerRequestDestAddress(r *http.Request) (name, ip
 }
 
 func (h *headerManger) getNormalRequestDestAddress(r *http.Request) (name, ip, port string, err error) {
-	var nodeName string
-	nodeName, port, err = net.SplitHostPort(r.Host)
-	if err != nil {
-		return "", "", "", err
-	}
-	if nodeName == "" {
-		nodeName = r.Header.Get(utils.RavenProxyHostHeaderKey)
+	nodeName := r.Header.Get(utils.RavenProxyHostHeaderKey)
+	_, port, _ = net.SplitHostPort(r.Header.Get(utils.RavenProxyDestHeaderKey))
+	if nodeName == "" || port == "" {
+		nodeName, port, err = net.SplitHostPort(r.Host)
+		if err != nil {
+			return "", "", "", err
+		}
 	}
 	ipAddress := net.ParseIP(nodeName)
 	if ipAddress != nil {
-		klog.Warning(utils.FormatProxyServer("raven proxy server not support request.Host is %s", r.Host))
+		klog.Warningf("raven proxy server not support dest address %s and request.URL is %s", ipAddress, r.URL.String())
 		return "", "", "", nil
 	}
 	var node v1.Node
@@ -179,8 +179,7 @@ func (h *headerManger) getNormalRequestDestAddress(r *http.Request) (name, ip, p
 	}
 	name, err = h.getGatewayNodeName(&node)
 	if err != nil {
-		return "", "", "", fmt.Errorf("gateway include node %s, has no active endpoints, error %s",
-			node.Name, err.Error())
+		return "", "", "", fmt.Errorf("can not find gateway node for node %s, error %s", node.Name, err.Error())
 	}
 	ip = getNodeIP(&node)
 	if ip == "" {
@@ -240,6 +239,18 @@ func (h *headerManger) getGatewayNodeName(node *v1.Node) (string, error) {
 		}
 		return "", err
 	}
-	rand.Seed(time.Now().Unix())
-	return gw.Status.ActiveEndpoints[rand.Intn(len(gw.Status.ActiveEndpoints))].NodeName, nil
+	if gw.Status.ActiveEndpoints == nil {
+		return "", fmt.Errorf("no active endpoints for gw %s", gwName)
+	}
+	names := make([]string, 0)
+	for _, ep := range gw.Status.ActiveEndpoints {
+		if ep.Type == v1beta1.Proxy {
+			names = append(names, ep.NodeName)
+		}
+	}
+	if len(names) == 0 {
+		return "", fmt.Errorf("no active endpoints for gw %s", gwName)
+	}
+	rand.New(rand.NewSource(time.Now().Unix()))
+	return names[rand.Intn(len(names))], nil
 }
